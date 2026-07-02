@@ -8,6 +8,8 @@
 
 This package provides the `grite` and `grite-daemon` binaries as a pip-installable Python package. It is a thin wrapper around the native Rust binaries, automatically downloading the correct platform-specific binary during installation.
 
+**[Website](https://grite.neullabs.com)** · **[Documentation](https://docs.neullabs.com/grite)** · **[GitHub](https://github.com/neul-labs/grite)**
+
 ---
 
 ## Installation
@@ -100,6 +102,20 @@ For full documentation, including architecture, API reference, and advanced usag
 
 - [github.com/neul-labs/grite](https://github.com/neul-labs/grite)
 - [docs.neullabs.com/grite](https://docs.neullabs.com/grite)
+
+## Part of the Neul Labs toolchain
+
+Explore the rest of the Neul Labs developer tools:
+
+| Project | Description |
+| --- | --- |
+| [rjest](https://github.com/neul-labs/rjest) | A blazing-fast, Jest-compatible test runner — 100x faster warm runs. |
+| [rpytest](https://github.com/neul-labs/rpytest) | Run your pytest suite faster. Change nothing. |
+| [rninja](https://github.com/neul-labs/rninja) | Drop-in Ninja replacement with built-in caching. |
+| [gity](https://github.com/neul-labs/gity) | Make large Git repositories feel instant. |
+| [stkd](https://github.com/neul-labs/stkd) | Stacked diffs for GitHub and GitLab. |
+
+Learn more at [neullabs.com](https://www.neullabs.com).
 
 ## License
 

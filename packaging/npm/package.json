@@ -9,7 +9,7 @@
     "cli",
     "coding-agents"
   ],
-  "homepage": "https://github.com/neul-labs/grite",
+  "homepage": "https://grite.neullabs.com",
   "bugs": {
     "url": "https://github.com/neul-labs/grite/issues"
   },
@@ -18,7 +18,7 @@
     "url": "git+https://github.com/neul-labs/grite.git"
   },
   "license": "MIT",
-  "author": "Neul Labs",
+  "author": "Neul Labs <contact@neullabs.com>",
   "main": "index.js",
   "bin": {
     "grite": "bin/grite",

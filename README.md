@@ -12,6 +12,8 @@
 
 Grite stores issues as an append-only event log inside git refs (`refs/grite/wal`), keeping your working tree pristine while enabling seamless multi-agent collaboration through deterministic CRDT-based conflict resolution. No servers. No databases. No merge conflicts. Just git.
 
+**[Website](https://grite.neullabs.com)** · **[Documentation](https://docs.neullabs.com/grite)** · **[GitHub](https://github.com/neul-labs/grite)**
+
 ---
 
 ## What is Grite?
@@ -481,8 +483,24 @@ RUST_LOG=debug cargo run --bin grite -- issue list
 
 ---
 
+## Part of the Neul Labs toolchain
+
+Explore the rest of the Neul Labs developer tools:
+
+| Project | Description |
+| --- | --- |
+| [rjest](https://github.com/neul-labs/rjest) | A blazing-fast, Jest-compatible test runner — 100x faster warm runs. |
+| [rpytest](https://github.com/neul-labs/rpytest) | Run your pytest suite faster. Change nothing. |
+| [rninja](https://github.com/neul-labs/rninja) | Drop-in Ninja replacement with built-in caching. |
+| [gity](https://github.com/neul-labs/gity) | Make large Git repositories feel instant. |
+| [stkd](https://github.com/neul-labs/stkd) | Stacked diffs for GitHub and GitLab. |
+
+Learn more at [neullabs.com](https://www.neullabs.com).
+
+---
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-Grite is built by [Neul Labs](https://neullabs.com).
+Grite is built by [Neul Labs](https://www.neullabs.com).

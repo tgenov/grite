@@ -9,7 +9,7 @@ description = "Git-backed issue tracking for coding agents and humans"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Neul Labs"}
+    {name = "Neul Labs", email = "contact@neullabs.com"}
 ]
 keywords = ["git", "issue-tracking", "task-management", "cli", "coding-agents"]
 classifiers = [
@@ -30,7 +30,8 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/neul-labs/grite"
+Homepage = "https://grite.neullabs.com"
+Documentation = "https://docs.neullabs.com/grite"
 Repository = "https://github.com/neul-labs/grite"
 Issues = "https://github.com/neul-labs/grite/issues"
 

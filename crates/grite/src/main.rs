@@ -79,8 +79,13 @@ fn try_route_through_daemon(
             Ok(Some(handle_daemon_response(cli, response)))
         }
         router::RouteResult::Blocked { pid, expires_in_ms } => {
+            // Reaching this means a *live* process holds the cache lease but
+            // does not answer IPC. `--no-daemon` is deliberately not offered
+            // here: it would contend for the same sled store and fail with
+            // db_busy, which is exactly the failure being reported.
             Err(GriteError::DbBusy(format!(
-                "Data directory locked by daemon (PID {}, expires in {}s). Use --no-daemon to wait or try later.",
+                "Data directory held by an unreachable daemon (PID {}, lease expires in {}s). \
+Run `grite daemon status` to inspect it, then `grite daemon stop` to clear it.",
                 pid,
                 expires_in_ms / 1000
             )))

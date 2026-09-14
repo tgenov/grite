@@ -315,51 +315,58 @@ impl GriteContext {
         event
     }
 
-    /// Determine execution mode (local vs daemon)
+    /// Determine execution mode (local vs daemon).
+    ///
+    /// Reachability is decided by connecting to the daemon endpoint, not by
+    /// reading `daemon.lock`. The lock is a worker's advisory lease over the
+    /// sled cache: it appears only once a worker exists, and it outlives a
+    /// daemon that crashed. Trusting it produced two failures — commands
+    /// running in-process while a healthy daemon was available, and commands
+    /// rejected with `db_busy` for the remainder of a dead daemon's lease.
     ///
     /// Resolution order:
-    /// 1. If --no-daemon flag is set, always use Local
-    /// 2. Check for daemon.lock file in data directory
-    /// 3. If lock exists and is valid, try to connect to daemon
-    /// 4. If connection succeeds, return Daemon mode
-    /// 5. If lock is valid but connection fails, return Blocked
-    /// 6. If no lock or lock is expired, return Local
+    /// 1. `--no-daemon` forces Local.
+    /// 2. Connect to the configured endpoint; success means Daemon.
+    /// 3. Otherwise consult the lock. A *live* lock (lease valid and holder
+    ///    process still running) naming a different endpoint is retried
+    ///    there, and if that also fails the data directory really is owned by
+    ///    someone unreachable, so report Blocked.
+    /// 4. A stale lock is removed and we fall through to Local.
     pub fn execution_mode(&self, no_daemon: bool) -> ExecutionMode {
         // 1. Check --no-daemon flag
         if no_daemon {
             return ExecutionMode::Local;
         }
 
-        // 2. Check for daemon lock
-        match DaemonLock::read(&self.git_dir.join("grite")) {
-            Ok(Some(lock)) => {
-                // 3. Check if lock is still valid
-                if lock.is_expired() {
-                    // Lock expired, can execute locally
-                    return ExecutionMode::Local;
-                }
+        // 2. The daemon that answers is the daemon that matters
+        let endpoint = libgrite_ipc::default_socket_path();
+        if let Ok(client) = IpcClient::connect(&endpoint) {
+            return ExecutionMode::Daemon { endpoint, client };
+        }
 
-                // 4. Try to connect to daemon
-                match IpcClient::connect(&lock.ipc_endpoint) {
-                    Ok(client) => ExecutionMode::Daemon {
-                        endpoint: lock.ipc_endpoint.clone(),
-                        client,
-                    },
-                    Err(_) => {
-                        // 5. Lock valid but can't connect - blocked
-                        ExecutionMode::Blocked { lock }
-                    }
-                }
-            }
-            Ok(None) => {
-                // No lock file, execute locally
-                ExecutionMode::Local
-            }
-            Err(_) => {
-                // Error reading lock, execute locally
-                ExecutionMode::Local
+        let grite_dir = self.git_dir.join("grite");
+        let Ok(Some(lock)) = DaemonLock::read(&grite_dir) else {
+            return ExecutionMode::Local;
+        };
+
+        // 4. The holder is gone (crashed, or its lease ran out): reclaim.
+        if lock.is_stale() {
+            let _ = DaemonLock::remove(&grite_dir);
+            return ExecutionMode::Local;
+        }
+
+        // 3. A live holder on a different endpoint — follow it.
+        if lock.ipc_endpoint != endpoint {
+            if let Ok(client) = IpcClient::connect(&lock.ipc_endpoint) {
+                return ExecutionMode::Daemon {
+                    endpoint: lock.ipc_endpoint.clone(),
+                    client,
+                };
             }
         }
+
+        // A live process holds the cache but will not talk to us.
+        ExecutionMode::Blocked { lock }
     }
 }
 

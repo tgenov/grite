@@ -21,10 +21,18 @@ pub use host::{host_id, process_alive};
 pub use lock::DaemonLock;
 pub use messages::{IpcCommand, IpcErrorPayload, IpcRequest, IpcResponse};
 pub use notifications::Notification;
-pub use probe::{is_listening, probe_daemon, probe_daemon_with_timeout, DaemonInfo};
+pub use probe::{
+    is_listening, probe, probe_daemon, probe_daemon_with_timeout, probe_with_timeout, DaemonInfo,
+    ProbeOutcome,
+};
 
-/// Current IPC schema version
-pub const IPC_SCHEMA_VERSION: u32 = 1;
+/// Current IPC schema version.
+///
+/// Bumped to 2 when `IpcRequest` gained `git_dir`. The wire format is rkyv,
+/// so a mismatched peer cannot be parsed safely — the supervisor rejects
+/// foreign versions before dispatch, and the CLI surfaces that as a daemon
+/// that needs restarting rather than as an opaque failure.
+pub const IPC_SCHEMA_VERSION: u32 = 2;
 
 /// Default request timeout in milliseconds
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;

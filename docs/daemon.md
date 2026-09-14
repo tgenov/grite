@@ -161,15 +161,24 @@ Example:
 The lock is a worker's advisory lease over the sled cache. It is **not** the
 source of truth for whether a daemon is running: it is written lazily, when
 the first repo-scoped command creates a worker, and it outlives a daemon that
-crashed. Liveness is always decided by an IPC round-trip.
+crashed.
+
+Liveness is decided by a `DaemonStatus` round-trip, never by the lock and
+never by a bare `connect()`. A bare connect proves nothing: the kernel
+completes the handshake from the listen backlog, so a daemon that is stopped,
+paged out, or blocked still accepts connections while answering nothing. Only
+a completed round-trip shows the daemon is making progress.
+
+The lease does decide *which* daemon owns the store, so routing follows it
+before falling back to the configured endpoint:
 
 | Scenario | CLI Behavior |
 |----------|--------------|
-| IPC endpoint answers | Route through daemon (regardless of the lock) |
-| Nothing answers, no lock | Auto-spawn, else execute locally |
-| Nothing answers, lock holder process is gone | Remove the stale lock, auto-spawn |
-| Nothing answers, lock holder alive on another endpoint | Follow that endpoint |
-| Nothing answers, lock holder alive and unreachable | Error naming the PID |
+| A live lease whose endpoint answers | Route there — that daemon owns the store |
+| No usable lease, configured endpoint answers | Route there |
+| Lock holder process is gone | Remove the stale lock, auto-spawn |
+| Nothing answers anywhere, live lease | Error naming the PID; `grite daemon stop` clears it |
+| Endpoint occupied but silent | Treated as unusable; `start` reports the occupant instead of spawning a competitor that would lose the bind |
 
 A lock is stale when its lease has expired **or** when the process that wrote
 it no longer exists. The second condition matters: without it, a crashed
@@ -207,6 +216,12 @@ $ grite daemon status --json
 }
 ```
 
+`daemon stop` exits non-zero if it could not confirm the daemon went away;
+it exits 0 when there was nothing to stop. Note that `expires_ts`, `expired`
+and `time_remaining_ms` now live under `lock` rather than at the top level,
+and `pid`/`started_ts` describe the live daemon rather than the lease's
+writer.
+
 `running` reflects whether a daemon answered on the endpoint. The `lock`
 object describes the cache lease and is informational only — a daemon that
 has just started has `worker_count: 0` and no lock, and is still running.
@@ -224,6 +239,8 @@ has just started has `worker_count: 0` and no lock, and is still running.
 | Failure | Recovery |
 |---------|----------|
 | Daemon crashes | Next command sees the holder PID is gone, clears the lock, and auto-spawns a replacement |
+| Daemon wedged (stopped, paged out, blocked) | Reported as not running; `daemon stop` still delivers the shutdown, and `daemon start` reports the occupant rather than spawning a competitor |
+| Lease unverifiable (foreign host, recycled PID) and its endpoint unserved | `grite daemon stop` clears it |
 | Daemon fails to start | `daemon start` reports the child's exit status and the tail of `.git/grite/daemon.log` |
 | IPC timeout | CLI retries 3 times, then errors |
 | Worker panics | Supervisor continues, worker restarted on next request |

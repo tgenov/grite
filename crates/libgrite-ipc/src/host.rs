@@ -7,22 +7,23 @@
 /// Get a stable identifier for this host.
 ///
 /// Resolution order:
-/// 1. `HOSTNAME` environment variable
-/// 2. `gethostname(2)` (works on macOS, which has no `/etc/hostname`)
-/// 3. `/etc/hostname`
+/// 1. `gethostname(2)` — the kernel's answer, identical for every process on
+///    the machine regardless of how each one was launched
+/// 2. `/etc/hostname`
+/// 3. `HOSTNAME` environment variable
 /// 4. `"unknown-host"`
 ///
-/// This must never fall back to a random value: a random host id makes every
-/// lock look like it came from a foreign machine, which disables the
-/// process-liveness check used for stale-lock recovery.
+/// Two properties matter, and both are easy to lose:
+///
+/// - **Never random.** A random id makes every lock look foreign, which
+///   disables the process-liveness check behind stale-lock recovery.
+/// - **Never environment-dependent when a kernel answer exists.** `HOSTNAME`
+///   is deliberately *last*: containers set it to the container id, and agent
+///   harnesses may set it per worktree. If the daemon and a later CLI disagree
+///   about it, every lock the daemon wrote looks foreign, liveness checking
+///   switches off, and a crashed daemon wedges the repository for its whole
+///   lease — the exact failure stale-lock recovery exists to prevent.
 pub fn host_id() -> String {
-    if let Ok(name) = std::env::var("HOSTNAME") {
-        let name = name.trim().to_string();
-        if !name.is_empty() {
-            return name;
-        }
-    }
-
     #[cfg(unix)]
     if let Some(name) = gethostname() {
         return name;
@@ -30,6 +31,13 @@ pub fn host_id() -> String {
 
     if let Ok(contents) = std::fs::read_to_string("/etc/hostname") {
         let name = contents.trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    if let Ok(name) = std::env::var("HOSTNAME") {
+        let name = name.trim().to_string();
         if !name.is_empty() {
             return name;
         }
@@ -98,6 +106,26 @@ mod tests {
         let second = host_id();
         assert_eq!(first, second, "host id must be stable across calls");
         assert!(!first.is_empty());
+    }
+
+    /// Regression: `HOSTNAME` must not be able to shift our identity, or two
+    /// processes on one machine can disagree about who wrote a lock.
+    #[test]
+    fn host_id_ignores_a_conflicting_hostname_env_var() {
+        // Safe here: this test does not spawn threads that read the
+        // environment, and the value is restored before it returns.
+        let previous = std::env::var("HOSTNAME").ok();
+        std::env::set_var("HOSTNAME", "some-unrelated-name-4f2a");
+        let with_env = host_id();
+        match previous {
+            Some(value) => std::env::set_var("HOSTNAME", value),
+            None => std::env::remove_var("HOSTNAME"),
+        }
+
+        assert_ne!(
+            with_env, "some-unrelated-name-4f2a",
+            "HOSTNAME must not override the kernel hostname"
+        );
     }
 
     #[test]

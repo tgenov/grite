@@ -489,7 +489,9 @@ fn concurrent_writes_from_two_worktrees_all_succeed() {
             let title = format!("{}-{}", actor, i);
             children.push(
                 Command::new(grite_bin())
-                    .args(["--json", "--actor", actor, "issue", "create", "--title"])
+                    .args([
+                        "--json", "--quiet", "--actor", actor, "issue", "create", "--title",
+                    ])
                     .arg(&title)
                     .current_dir(cwd)
                     .env("GRITE_DAEMON_SOCKET", &fx.socket)
@@ -626,9 +628,287 @@ fn stop_when_not_running_is_a_clean_no_op() {
     assert_eq!(stopped["cleaned_stale_lock"], false);
 }
 
-fn kill9(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-9", &pid.to_string()])
+// ---------------------------------------------------------------------------
+// 7. A daemon that is listening but not answering
+// ---------------------------------------------------------------------------
+//
+// The kernel completes a connect() from the listen backlog, so a daemon that
+// is stopped, paged out, or blocked on its worker mutex still accepts
+// connections while answering nothing. An earlier revision decided routing on
+// a bare connect() while `status` did a full round-trip, so the two disagreed
+// about the same daemon: `status` called it dead and the next command routed
+// to it and hung.
+
+/// A bare listener with nobody serving it: the cheap, deterministic stand-in
+/// for a wedged daemon.
+fn occupy(path: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("bind stand-in listener")
+}
+
+#[test]
+fn status_reports_a_listening_but_silent_endpoint_as_not_running() {
+    let fx = Fixture::new();
+    let _listener = occupy(&fx.socket);
+
+    let status = fx.status();
+    assert_eq!(
+        status["running"], false,
+        "a peer that never answers is not a usable daemon"
+    );
+}
+
+/// `start` must not spawn a competitor for an occupied endpoint: the new
+/// process would lose the bind and exit, turning a transient stall into a
+/// hard failure. Regression — this used to exit 1 with "Another supervisor is
+/// already listening".
+#[test]
+fn start_against_an_occupied_endpoint_reports_rather_than_failing() {
+    let fx = Fixture::new();
+    let _listener = occupy(&fx.socket);
+
+    let out = fx.grite(&["daemon", "start"], None);
+    out.assert_success("daemon start against an occupied endpoint");
+
+    let started = json(&out);
+    assert_eq!(started["started"], false);
+    assert_eq!(started["ready"], false);
+    assert!(
+        started["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not answer"),
+        "reason should name the unanswering occupant, got {:?}",
+        started["reason"]
+    );
+}
+
+/// Routing must reach the same verdict as `status` — not treat the wedged
+/// daemon as usable and block on it.
+#[test]
+fn routing_agrees_with_status_about_a_silent_endpoint() {
+    let fx = Fixture::new();
+    let _listener = occupy(&fx.socket);
+
+    assert_eq!(fx.status()["running"], false);
+
+    let started = Instant::now();
+    let out = fx.grite(&["issue", "list"], None);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "routing should not block on a silent daemon; took {elapsed:?}"
+    );
+    // Either it reports the endpoint as unusable, or it runs in-process — but
+    // it must not hang, and must not claim the daemon served the request.
+    assert!(
+        !out.stderr_text().contains("timed out after"),
+        "routing should not have waited out an IPC timeout: {}",
+        out.stderr_text()
+    );
+}
+
+/// A real wedged daemon: SIGSTOP, then confirm `stop` still delivers the
+/// shutdown (queued in the socket) rather than declaring it "not running" and
+/// walking away, which would leave it alive with no way to remove it.
+#[test]
+fn stop_reaches_a_stopped_daemon_once_it_resumes() {
+    let fx = Fixture::new();
+    let pid = json(&fx.grite(&["daemon", "start"], None))["pid"]
+        .as_u64()
+        .unwrap() as u32;
+
+    signal(pid, "STOP");
+
+    // `stop` cannot confirm an exit while the process is frozen, so it fails
+    // loudly rather than silently reporting success.
+    let out = fx.grite(&["daemon", "stop"], None);
+    assert!(
+        !out.status.success(),
+        "stop must not claim success it could not confirm"
+    );
+    assert_eq!(json(&out)["stopped"], false);
+
+    // But the DaemonStop was delivered: on resume, the daemon acts on it.
+    signal(pid, "CONT");
+    assert!(
+        wait_until(Duration::from_secs(20), || !pid_alive(pid)),
+        "a resumed daemon should act on the queued stop; PID {pid} still alive"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Endpoint precedence across two sockets
+// ---------------------------------------------------------------------------
+
+/// The lease says which daemon owns the sled store. Routing must follow it,
+/// even when this process is configured to use a different endpoint —
+/// otherwise a second daemon steals the routing and cannot open the store,
+/// and every command fails `db_busy`.
+///
+/// `GRITE_DAEMON_SOCKET` makes this configuration easy to reach: two agents
+/// that disagree about it share one repository.
+#[test]
+fn a_live_lease_wins_over_a_differently_configured_endpoint() {
+    let fx = Fixture::new();
+    let other_socket = PathBuf::from(format!(
+        "/tmp/grite-t{}-{}b.sock",
+        std::process::id(),
+        SOCKET_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&other_socket);
+
+    // Daemon A owns the store: start it and make it create a worker, so the
+    // lease on disk records A's endpoint.
+    json(&fx.grite(&["daemon", "start"], None));
+    fx.grite(&["issue", "create", "--title", "owned by A"], None)
+        .assert_success("issue create via A");
+    assert!(fx.lock_path().exists(), "A should hold the lease");
+
+    // Daemon B is live on a different socket.
+    json(&fx.grite(&["daemon", "start"], Some(&other_socket)));
+
+    // A command configured for B must still reach A, which owns the store.
+    let out = fx.grite_in(
+        &fx.main.clone(),
+        &[
+            "issue",
+            "create",
+            "--title",
+            "routed while configured for B",
+        ],
+        Some(&other_socket),
+    );
+    out.assert_success("write while configured for the non-owning endpoint");
+    assert!(
+        !out.stderr_text().contains("db_busy"),
+        "must not contend for the store: {}",
+        out.stderr_text()
+    );
+
+    // A did the work; B never opened the store.
+    let a_status = fx.status();
+    assert_eq!(a_status["worker_count"].as_u64().unwrap(), 1);
+    let b_status = json(&fx.grite(&["daemon", "status"], Some(&other_socket)));
+    assert_eq!(
+        b_status["worker_count"].as_u64().unwrap(),
+        0,
+        "the non-owning daemon should never have opened the store"
+    );
+
+    let _ = fx.grite(&["daemon", "stop"], Some(&other_socket));
+    let _ = std::fs::remove_file(&other_socket);
+    fx.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 9. Host identity must not depend on the environment
+// ---------------------------------------------------------------------------
+
+/// Stale-lock recovery compares the lock's `host_id` against our own, and
+/// skips the PID check when they differ. So if `HOSTNAME` could shift that
+/// identity, a daemon and a later CLI launched from different environments
+/// would disagree, liveness checking would switch off, and a crashed daemon
+/// would wedge the repository for its whole lease.
+///
+/// Containers set `HOSTNAME` to the container id, and agent harnesses may set
+/// it per worktree, so this is not hypothetical.
+#[test]
+fn a_conflicting_hostname_env_var_does_not_disable_stale_lock_recovery() {
+    let fx = Fixture::new();
+
+    // Start the daemon from an environment that claims a different hostname.
+    let out = Command::new(grite_bin())
+        .args(["--json", "daemon", "start"])
+        .current_dir(&fx.main)
+        .env("GRITE_DAEMON_SOCKET", &fx.socket)
+        .env("GRITE_DAEMON_BIN", daemon_bin())
+        .env("HOSTNAME", "some-container-id-4f2a")
+        .env_remove("XDG_RUNTIME_DIR")
         .output()
-        .expect("send SIGKILL");
+        .expect("run grite");
+    out.assert_success("daemon start with a conflicting HOSTNAME");
+    let pid = json(&out)["pid"].as_u64().unwrap() as u32;
+
+    // Make it write the lease.
+    fx.grite(&["issue", "list"], None)
+        .assert_success("issue list");
+    let lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.lock_path()).expect("read lease"))
+            .expect("parse lease");
+    assert_ne!(
+        lock["host_id"], "some-container-id-4f2a",
+        "host identity must come from the kernel, not the environment"
+    );
+
+    // Now crash it and recover from an environment with no HOSTNAME at all.
+    kill9(pid);
+    assert!(wait_until(Duration::from_secs(5), || !pid_alive(pid)));
+
+    let status = fx.status();
+    assert_eq!(status["running"], false);
+    assert_eq!(
+        status["lock"]["stale"], true,
+        "the lease must be recognised as stale despite the HOSTNAME mismatch"
+    );
+
+    fx.grite(&["issue", "create", "--title", "after crash"], None)
+        .assert_success("write after crash");
+
+    fx.stop();
+}
+
+/// Whatever the host bookkeeping says, an explicit `daemon stop` must be able
+/// to clear a lease that nothing is serving. This is the operator escape
+/// hatch the `db_busy` message points at, so it has to actually work.
+#[test]
+fn stop_clears_a_lease_whose_endpoint_nobody_serves() {
+    let fx = Fixture::new();
+
+    // A lease from another machine: we cannot check its PID, and its endpoint
+    // does not exist.
+    std::fs::create_dir_all(fx.grite_dir()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::write(
+        fx.lock_path(),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": std::process::id(),
+            "started_ts": now,
+            "repo_root": fx.main.to_str().unwrap(),
+            "actor_id": "0".repeat(32),
+            "host_id": "some-other-machine",
+            "ipc_endpoint": "/tmp/grite-nobody-serves-this-7b3e.sock",
+            "lease_ms": 30_000u64,
+            "last_heartbeat_ts": now,
+            "expires_ts": now + 30_000,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let stopped = json(&fx.grite(&["daemon", "stop"], None));
+    assert_eq!(stopped["cleaned_stale_lock"], true);
+    assert!(
+        !fx.lock_path().exists(),
+        "an unreachable lease must be clearable by an explicit stop"
+    );
+}
+
+fn kill9(pid: u32) {
+    signal(pid, "KILL");
+}
+
+fn signal(pid: u32, name: &str) {
+    let out = Command::new("kill")
+        .args([&format!("-{name}"), &pid.to_string()])
+        .output()
+        .expect("send signal");
+    assert!(
+        out.status.success(),
+        "kill -{name} {pid} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

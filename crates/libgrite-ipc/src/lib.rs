@@ -13,6 +13,7 @@ pub mod host;
 pub mod lock;
 pub mod messages;
 pub mod notifications;
+pub mod probe;
 
 pub use client::IpcClient;
 pub use error::IpcError;
@@ -20,6 +21,7 @@ pub use host::{host_id, process_alive};
 pub use lock::DaemonLock;
 pub use messages::{IpcCommand, IpcErrorPayload, IpcRequest, IpcResponse};
 pub use notifications::Notification;
+pub use probe::{is_listening, probe_daemon, probe_daemon_with_timeout, DaemonInfo};
 
 /// Current IPC schema version
 pub const IPC_SCHEMA_VERSION: u32 = 1;

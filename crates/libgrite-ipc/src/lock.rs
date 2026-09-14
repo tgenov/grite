@@ -226,6 +226,28 @@ impl DaemonLock {
         }
     }
 
+    /// Remove the lock if nothing can be using it, and report what was removed.
+    ///
+    /// Stronger than [`remove_if_stale`](Self::remove_if_stale): it also
+    /// clears a lock whose holder cannot be *verified* — one written on
+    /// another host, or naming a PID that has since been recycled — when
+    /// nothing is serving the endpoint that lock recorded. Such a lock cannot
+    /// be doing its job, whoever wrote it.
+    ///
+    /// This is the operator escape hatch, reached only from an explicit
+    /// `grite daemon stop`. Routing must stay conservative and use
+    /// `remove_if_stale`, so that a daemon which is merely wedged is reported
+    /// rather than having its lease pulled out from under it.
+    pub fn remove_if_unusable(data_dir: &Path) -> Result<Option<Self>, IpcError> {
+        match Self::read(data_dir)? {
+            Some(lock) if lock.is_stale() || !crate::probe::is_listening(&lock.ipc_endpoint) => {
+                Self::remove(data_dir)?;
+                Ok(Some(lock))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Release the lock (only if owned by current process)
     pub fn release(data_dir: &Path) -> Result<(), IpcError> {
         if let Some(lock) = Self::read(data_dir)? {
@@ -508,6 +530,54 @@ mod tests {
             Some("/tmp/dead.sock")
         );
         assert!(DaemonLock::read(data_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_if_unusable_clears_a_foreign_host_lock_with_no_listener() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        // A lock we cannot verify: another host, live lease, live-looking PID.
+        // Nothing is serving its endpoint, so it cannot be doing its job.
+        DaemonLock::new(
+            std::process::id(),
+            "/repo".to_string(),
+            "actor".to_string(),
+            "some-other-machine".to_string(),
+            "/tmp/grite-nothing-here-8c1d.sock".to_string(),
+        )
+        .write(data_dir)
+        .unwrap();
+
+        // The conservative path leaves it alone...
+        assert!(DaemonLock::remove_if_stale(data_dir).unwrap().is_none());
+        assert!(DaemonLock::read(data_dir).unwrap().is_some());
+
+        // ...and the operator escape hatch clears it.
+        let removed = DaemonLock::remove_if_unusable(data_dir).unwrap();
+        assert!(removed.is_some(), "an unreachable lock must be clearable");
+        assert!(DaemonLock::read(data_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_if_unusable_keeps_a_lock_whose_endpoint_answers() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let socket = temp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        DaemonLock::new(
+            std::process::id(),
+            "/repo".to_string(),
+            "actor".to_string(),
+            crate::host::host_id(),
+            socket.to_str().unwrap().to_string(),
+        )
+        .write(data_dir)
+        .unwrap();
+
+        assert!(DaemonLock::remove_if_unusable(data_dir).unwrap().is_none());
+        assert!(DaemonLock::read(data_dir).unwrap().is_some());
     }
 
     #[test]

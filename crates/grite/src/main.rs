@@ -79,13 +79,21 @@ fn try_route_through_daemon(
             Ok(Some(handle_daemon_response(cli, response)))
         }
         router::RouteResult::Blocked { pid, expires_in_ms } => {
-            // Reaching this means a *live* process holds the cache lease but
-            // does not answer IPC. `--no-daemon` is deliberately not offered
-            // here: it would contend for the same sled store and fail with
-            // db_busy, which is exactly the failure being reported.
+            // Reaching this means a process holds the cache lease and does
+            // not answer a status probe. `grite daemon stop` is the remedy:
+            // it shuts down a daemon that is merely wedged, and clears the
+            // lease outright when nothing is serving its endpoint.
+            //
+            // `--no-daemon` is mentioned last and deliberately hedged. If the
+            // holder is genuinely alive it owns the sled flock, so bypassing
+            // the daemon just fails again; but if the lease outlived its
+            // writer, the flock is already released and running in-process is
+            // the one thing that works. Naming it beats leaving the user with
+            // no escape hatch at all.
             Err(GriteError::DbBusy(format!(
-                "Data directory held by an unreachable daemon (PID {}, lease expires in {}s). \
-Run `grite daemon status` to inspect it, then `grite daemon stop` to clear it.",
+                "Data directory held by a daemon that is not answering (PID {}, lease expires in {}s). \
+Run `grite daemon stop` to clear it, then retry. \
+If that does not help, `grite --no-daemon <command>` runs in-process.",
                 pid,
                 expires_in_ms / 1000
             )))

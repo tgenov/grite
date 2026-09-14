@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use libgrite_core::GriteError;
-use libgrite_ipc::{DaemonLock, IpcClient, IpcCommand, IpcRequest};
+use libgrite_ipc::{is_listening, DaemonInfo, DaemonLock, IpcClient, IpcCommand, IpcRequest};
 
 use crate::cli::{Cli, DaemonCommand};
 use crate::context::GriteContext;
@@ -41,70 +41,14 @@ pub fn get_default_daemon_endpoint() -> String {
     libgrite_ipc::default_socket_path()
 }
 
-/// A daemon's self-reported status, obtained over IPC.
+/// Ask the daemon at `endpoint` to identify itself.
 ///
-/// This is the only trustworthy answer to "is a daemon running?": a socket
-/// that answers a `DaemonStatus` round-trip cannot be a leftover file, a dead
-/// process, or a lease that has not been cleaned up.
-#[derive(Debug, Clone)]
-pub struct DaemonInfo {
-    pub pid: u32,
-    pub daemon_id: String,
-    pub host_id: String,
-    pub endpoint: String,
-    pub started_ts: u64,
-    pub worker_count: u64,
-    pub state: String,
-}
-
-/// Ask the daemon at `endpoint` to describe itself.
-///
-/// Returns `None` when no daemon answers — connection refused, a stale socket
-/// file, a hung peer, or a protocol mismatch all mean "not usable".
+/// Delegates to the shared oracle in `libgrite-ipc` so that `status`, `stop`
+/// and command routing cannot drift apart — an earlier revision had `status`
+/// doing a round-trip while routing did a bare `connect()`, so a wedged
+/// daemon was reported dead by one and used by the other.
 pub fn query_daemon(endpoint: &str) -> Option<DaemonInfo> {
-    let mut client = IpcClient::connect_with_timeout(endpoint, 2_000).ok()?;
-
-    // `DaemonStatus` is answered by the supervisor itself and never touches a
-    // worker or the sled store, so it stays cheap and cannot block on I/O.
-    let request = IpcRequest::new(
-        uuid::Uuid::new_v4().to_string(),
-        String::new(),
-        String::new(),
-        String::new(),
-        IpcCommand::DaemonStatus,
-    );
-
-    let response = client.send(&request).ok()?;
-    let data = response.data?;
-    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-
-    Some(DaemonInfo {
-        pid: value.get("pid")?.as_u64()? as u32,
-        daemon_id: json_str(&value, "daemon_id"),
-        host_id: json_str(&value, "host_id"),
-        endpoint: value
-            .get("ipc_endpoint")
-            .and_then(|v| v.as_str())
-            .unwrap_or(endpoint)
-            .to_string(),
-        started_ts: value
-            .get("started_ts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        worker_count: value
-            .get("worker_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        state: json_str(&value, "state"),
-    })
-}
-
-fn json_str(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string()
+    libgrite_ipc::probe_daemon(endpoint)
 }
 
 /// Check if a daemon is reachable on the default endpoint.
@@ -151,6 +95,33 @@ fn start_internal(cli: &Cli, idle_timeout: u64) -> Result<(), GriteError> {
             );
         } else if !cli.quiet {
             println!("Daemon already running (PID {})", info.pid);
+        }
+        return Ok(());
+    }
+
+    // Nothing answered, but something may still hold the listening end. A
+    // daemon that is merely slow to respond is not a reason to spawn a
+    // competitor: the new process would lose the bind and exit, turning a
+    // transient stall into a hard failure. Report the occupant instead.
+    if is_listening(&endpoint) {
+        let occupant = DaemonLock::read(&grite_dir).ok().flatten();
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "started": false,
+                    "ready": false,
+                    "reason": "Endpoint is occupied by a daemon that did not answer a status request",
+                    "endpoint": endpoint,
+                    "pid": occupant.as_ref().map(|l| l.pid),
+                })
+            );
+        } else if !cli.quiet {
+            println!(
+                "Daemon on {} is not answering (it may be busy or stopped).",
+                endpoint
+            );
+            println!("  Run `grite daemon stop` to clear it, then start again.");
         }
         return Ok(());
     }
@@ -528,10 +499,19 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
     let grite_dir = ctx.git_dir.join("grite");
     let endpoint = get_default_daemon_endpoint();
 
-    let Some(info) = query_daemon(&endpoint) else {
-        // Nothing is listening. Clear whatever a crashed daemon left behind
-        // so the next command can start cleanly.
-        let stale_lock = DaemonLock::remove_if_stale(&grite_dir)
+    // Resolve what to stop. A daemon that does not answer a status probe may
+    // still be there, holding the listening end — busy, paged out, or blocked
+    // — and `stop` must be able to shut it down anyway. Falling through to
+    // "not running" would leave it alive with no way to remove it.
+    let probed = query_daemon(&endpoint);
+    let occupied = probed.is_some() || is_listening(&endpoint);
+
+    if !occupied {
+        // Really nothing there. Clear whatever a crashed daemon left behind
+        // so the next command can start cleanly. This is the operator escape
+        // hatch, so it also clears a lock whose holder cannot be verified
+        // (foreign host, recycled PID) when nothing serves its endpoint.
+        let stale_lock = DaemonLock::remove_if_unusable(&grite_dir)
             .ok()
             .flatten()
             .is_some();
@@ -555,9 +535,15 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
             }
         }
         return Ok(());
-    };
+    }
 
-    let pid = info.pid;
+    // PID for the exit wait: the daemon's own answer when we have it, else
+    // the lease it wrote. Without either we can still send the stop and
+    // confirm by watching the endpoint go quiet.
+    let pid = probed
+        .as_ref()
+        .map(|info| info.pid)
+        .or_else(|| DaemonLock::read(&grite_dir).ok().flatten().map(|l| l.pid));
 
     // Ask the daemon to shut down. The connection may close before the
     // response arrives, which is not an error.
@@ -576,8 +562,23 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
 
     // The daemon releases its own lock and socket on a clean shutdown; clear
     // anything left over from an unclean one.
-    let _ = DaemonLock::remove_if_stale(&grite_dir);
-    remove_stale_socket(&endpoint);
+    if exited {
+        let _ = DaemonLock::remove_if_unusable(&grite_dir);
+        remove_stale_socket(&endpoint);
+    }
+
+    let failure = (!exited).then(|| match pid {
+        Some(pid) => format!(
+            "Daemon (PID {}) did not exit within {}s",
+            pid,
+            STOP_TIMEOUT.as_secs()
+        ),
+        None => format!(
+            "Daemon on {} did not stop within {}s",
+            endpoint,
+            STOP_TIMEOUT.as_secs()
+        ),
+    });
 
     if cli.json {
         println!(
@@ -585,35 +586,19 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
             serde_json::json!({
                 "stopped": exited,
                 "pid": pid,
-                "reason": if exited { serde_json::Value::Null } else {
-                    serde_json::Value::String(format!(
-                        "Daemon (PID {}) did not exit within {}s",
-                        pid,
-                        STOP_TIMEOUT.as_secs()
-                    ))
-                },
+                "reason": failure,
             })
         );
     } else if !cli.quiet {
-        if exited {
-            println!("Daemon stopped");
-        } else {
-            println!(
-                "Daemon (PID {}) did not exit within {}s",
-                pid,
-                STOP_TIMEOUT.as_secs()
-            );
+        match &failure {
+            None => println!("Daemon stopped"),
+            Some(message) => println!("{}", message),
         }
     }
 
-    if exited {
-        Ok(())
-    } else {
-        Err(GriteError::Internal(format!(
-            "Daemon (PID {}) did not exit within {}s",
-            pid,
-            STOP_TIMEOUT.as_secs()
-        )))
+    match failure {
+        None => Ok(()),
+        Some(message) => Err(GriteError::Internal(message)),
     }
 }
 
@@ -633,12 +618,19 @@ fn remove_stale_socket(endpoint: &str) -> bool {
 }
 
 /// Wait for the daemon to disappear: both the process and the endpoint.
-fn wait_for_daemon_exit(pid: u32, endpoint: &str, timeout: Duration) -> bool {
+///
+/// The endpoint going quiet is the part that always applies; the PID check is
+/// an extra confirmation for the common case where we know which process to
+/// watch. `is_listening` is the right test here rather than a status probe:
+/// we are waiting for the listening end to be released, and a daemon that
+/// stops answering while still holding the socket has not stopped.
+fn wait_for_daemon_exit(pid: Option<u32>, endpoint: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     let mut delay = Duration::from_millis(20);
 
     loop {
-        if !libgrite_ipc::process_alive(pid) && query_daemon(endpoint).is_none() {
+        let process_gone = !pid.is_some_and(libgrite_ipc::process_alive);
+        if process_gone && !is_listening(endpoint) {
             return true;
         }
         if start.elapsed() >= timeout {

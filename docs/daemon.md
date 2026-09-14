@@ -21,13 +21,19 @@ grite --no-daemon issue list
 
 The daemon automatically spawns when you run CLI commands:
 
-1. CLI checks for running daemon
-2. If no daemon, spawns `grite-daemon` in background
-3. Waits for daemon to become ready (up to 5 seconds)
+1. CLI connects to the IPC endpoint and asks the daemon to identify itself
+2. If nothing answers, spawns `grite-daemon` in background
+3. Waits for the daemon to answer a status round-trip (up to 10 seconds),
+   watching the child process so an early exit is reported immediately
 4. Routes command through IPC
 5. Daemon runs until idle timeout
 
 Default idle timeout is 5 minutes (300 seconds).
+
+If the daemon cannot be reached or started, the CLI prints a warning naming
+the cause and runs the command in-process. That fallback serialises poorly
+under concurrency, so set `GRITE_REQUIRE_DAEMON=1` to make it a hard error
+instead — concurrent agents should.
 
 ### Disabling Auto-Spawn
 
@@ -152,12 +158,22 @@ Example:
 
 ### Lock Rules
 
+The lock is a worker's advisory lease over the sled cache. It is **not** the
+source of truth for whether a daemon is running: it is written lazily, when
+the first repo-scoped command creates a worker, and it outlives a daemon that
+crashed. Liveness is always decided by an IPC round-trip.
+
 | Scenario | CLI Behavior |
 |----------|--------------|
-| No daemon lock | Execute locally or auto-spawn |
-| Lock valid, IPC reachable | Route through daemon |
-| Lock valid, IPC unreachable | Error (daemon may have crashed) |
-| Lock expired | Take over, execute locally |
+| IPC endpoint answers | Route through daemon (regardless of the lock) |
+| Nothing answers, no lock | Auto-spawn, else execute locally |
+| Nothing answers, lock holder process is gone | Remove the stale lock, auto-spawn |
+| Nothing answers, lock holder alive on another endpoint | Follow that endpoint |
+| Nothing answers, lock holder alive and unreachable | Error naming the PID |
+
+A lock is stale when its lease has expired **or** when the process that wrote
+it no longer exists. The second condition matters: without it, a crashed
+daemon blocks every command for the remainder of its 30-second lease.
 
 ## CLI Integration
 
@@ -170,7 +186,8 @@ Daemon is running
   Host ID:        my-laptop
   IPC Endpoint:   /tmp/grite-daemon.sock
   Started:        2024-01-15 10:30:00 UTC
-  Expires in:     25s
+  Workers:        1
+  State:          Running
 ```
 
 ### JSON Output
@@ -180,19 +197,34 @@ $ grite daemon status --json
 {
   "running": true,
   "pid": 12345,
+  "daemon_id": "9f2c...",
   "host_id": "my-laptop",
   "ipc_endpoint": "/tmp/grite-daemon.sock",
   "started_ts": 1705315800000,
-  "expires_ts": 1705315830000,
-  "time_remaining_ms": 25000
+  "worker_count": 1,
+  "state": "Running",
+  "lock": { "present": true, "pid": 12345, "stale": false, "holder_alive": true }
 }
 ```
+
+`running` reflects whether a daemon answered on the endpoint. The `lock`
+object describes the cache lease and is informational only — a daemon that
+has just started has `worker_count: 0` and no lock, and is still running.
+
+## Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `GRITE_DAEMON_SOCKET` | Override the IPC endpoint. Every process sharing a repository must agree on the value. |
+| `GRITE_DAEMON_BIN` | Path to the `grite-daemon` executable. |
+| `GRITE_REQUIRE_DAEMON=1` | Fail instead of falling back to in-process execution when the daemon is unreachable. |
 
 ## Failure Behavior
 
 | Failure | Recovery |
 |---------|----------|
-| Daemon crashes | Lock expires, CLI can take over |
+| Daemon crashes | Next command sees the holder PID is gone, clears the lock, and auto-spawns a replacement |
+| Daemon fails to start | `daemon start` reports the child's exit status and the tail of `.git/grite/daemon.log` |
 | IPC timeout | CLI retries 3 times, then errors |
 | Worker panics | Supervisor continues, worker restarted on next request |
 | Command error | Error returned via IPC, daemon continues |

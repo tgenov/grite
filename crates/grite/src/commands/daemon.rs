@@ -19,7 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use libgrite_core::GriteError;
-use libgrite_ipc::{is_listening, DaemonInfo, DaemonLock, IpcClient, IpcCommand, IpcRequest};
+use libgrite_ipc::{
+    is_listening, DaemonInfo, DaemonLock, IpcClient, IpcCommand, IpcRequest, ProbeOutcome,
+};
 
 use crate::cli::{Cli, DaemonCommand};
 use crate::context::GriteContext;
@@ -95,6 +97,30 @@ fn start_internal(cli: &Cli, idle_timeout: u64) -> Result<(), GriteError> {
             );
         } else if !cli.quiet {
             println!("Daemon already running (PID {})", info.pid);
+        }
+        return Ok(());
+    }
+
+    // A daemon from a different build is still holding the endpoint. Spawning
+    // a replacement would just lose the bind, so say what is wrong.
+    if let ProbeOutcome::Incompatible { detail } = libgrite_ipc::probe(&endpoint) {
+        let pid = DaemonLock::read(&grite_dir).ok().flatten().map(|l| l.pid);
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "started": false,
+                    "ready": false,
+                    "reason": "Incompatible daemon already running",
+                    "detail": detail,
+                    "endpoint": endpoint,
+                    "pid": pid,
+                })
+            );
+        } else if !cli.quiet {
+            println!("An incompatible daemon is running on {}", endpoint);
+            println!("  {}", detail);
+            println!("  Run `grite daemon stop` to replace it.");
         }
         return Ok(());
     }
@@ -376,13 +402,21 @@ fn status(cli: &Cli) -> Result<(), GriteError> {
     let grite_dir = ctx.git_dir.join("grite");
     let endpoint = get_default_daemon_endpoint();
 
-    let info = query_daemon(&endpoint);
+    let outcome = libgrite_ipc::probe(&endpoint);
+    let incompatible = match &outcome {
+        ProbeOutcome::Incompatible { detail } => Some(detail.clone()),
+        _ => None,
+    };
+    let info = match outcome {
+        ProbeOutcome::Live(info) => Some(info),
+        _ => None,
+    };
     let lock = DaemonLock::read(&grite_dir).ok().flatten();
 
     if cli.json {
-        output_status_json(cli, &endpoint, &info, &lock)?;
+        output_status_json(cli, &endpoint, &info, &lock, &incompatible)?;
     } else {
-        output_status_human(cli, &endpoint, &info, &lock)?;
+        output_status_human(cli, &endpoint, &info, &lock, &incompatible)?;
     }
 
     Ok(())
@@ -411,6 +445,7 @@ fn output_status_json(
     endpoint: &str,
     info: &Option<DaemonInfo>,
     lock: &Option<DaemonLock>,
+    incompatible: &Option<String>,
 ) -> Result<(), GriteError> {
     let output = match info {
         Some(info) => serde_json::json!({
@@ -427,7 +462,11 @@ fn output_status_json(
         None => serde_json::json!({
             "running": false,
             "ipc_endpoint": endpoint,
-            "reason": "No daemon answered on the IPC endpoint",
+            "reason": match incompatible {
+                Some(detail) => format!("Incompatible daemon on the IPC endpoint: {}", detail),
+                None => "No daemon answered on the IPC endpoint".to_string(),
+            },
+            "incompatible": incompatible.is_some(),
             "lock": lock_json(lock),
         }),
     };
@@ -444,6 +483,7 @@ fn output_status_human(
     endpoint: &str,
     info: &Option<DaemonInfo>,
     lock: &Option<DaemonLock>,
+    incompatible: &Option<String>,
 ) -> Result<(), GriteError> {
     if cli.quiet {
         return Ok(());
@@ -459,10 +499,18 @@ fn output_status_human(
             println!("  Workers:        {}", info.worker_count);
             println!("  State:          {}", info.state);
         }
-        None => {
-            println!("Daemon is not running");
-            println!("  IPC Endpoint:   {} (no response)", endpoint);
-        }
+        None => match incompatible {
+            Some(detail) => {
+                println!("An incompatible daemon is running");
+                println!("  IPC Endpoint:   {}", endpoint);
+                println!("  Detail:         {}", detail);
+                println!("  Run `grite daemon stop` to replace it.");
+            }
+            None => {
+                println!("Daemon is not running");
+                println!("  IPC Endpoint:   {} (no response)", endpoint);
+            }
+        },
     }
 
     if let Some(lock) = lock {
@@ -503,7 +551,12 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
     // still be there, holding the listening end — busy, paged out, or blocked
     // — and `stop` must be able to shut it down anyway. Falling through to
     // "not running" would leave it alive with no way to remove it.
-    let probed = query_daemon(&endpoint);
+    let outcome = libgrite_ipc::probe(&endpoint);
+    let incompatible = matches!(outcome, ProbeOutcome::Incompatible { .. });
+    let probed = match outcome {
+        ProbeOutcome::Live(info) => Some(info),
+        _ => None,
+    };
     let occupied = probed.is_some() || is_listening(&endpoint);
 
     if !occupied {
@@ -551,11 +604,31 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
         let request = IpcRequest::new(
             uuid::Uuid::new_v4().to_string(),
             ctx.repo_root().to_string_lossy().to_string(),
+            ctx.git_dir.to_string_lossy().to_string(),
             ctx.actor_id.clone(),
             ctx.data_dir.to_string_lossy().to_string(),
             IpcCommand::DaemonStop,
         );
         let _ = client.send(&request);
+    }
+
+    // A daemon from a different build cannot be stopped over IPC at all: the
+    // supervisor rejects foreign schema versions before it dispatches the
+    // command. Signal it instead — SIGTERM, which its own handler treats as a
+    // clean shutdown. Without this, upgrading the binaries would strand the
+    // old daemon holding the socket with no supported way to remove it.
+    if incompatible {
+        match pid {
+            Some(pid) => signal_terminate(pid),
+            None => {
+                return Err(GriteError::Internal(format!(
+                    "An incompatible daemon holds {} and cannot be stopped over IPC. \
+No PID was recorded, so it must be ended manually \
+(`pkill -f grite-daemon`), then retry.",
+                    endpoint
+                )));
+            }
+        }
     }
 
     let exited = wait_for_daemon_exit(pid, &endpoint, STOP_TIMEOUT);
@@ -599,6 +672,21 @@ fn stop_internal(cli: &Cli) -> Result<(), GriteError> {
     match failure {
         None => Ok(()),
         Some(message) => Err(GriteError::Internal(message)),
+    }
+}
+
+/// Ask a process to shut down cleanly.
+///
+/// The daemon installs a SIGTERM handler that runs its normal shutdown path,
+/// so this is a graceful stop, not a kill.
+fn signal_terminate(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: sending SIGTERM performs no memory access; an invalid PID simply
+    // returns ESRCH, which we ignore.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
     }
 }
 

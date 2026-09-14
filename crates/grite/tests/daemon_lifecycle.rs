@@ -711,6 +711,22 @@ fn routing_agrees_with_status_about_a_silent_endpoint() {
 /// A real wedged daemon: SIGSTOP, then confirm `stop` still delivers the
 /// shutdown (queued in the socket) rather than declaring it "not running" and
 /// walking away, which would leave it alive with no way to remove it.
+/// Resumes a frozen process on drop.
+///
+/// Without this, a panic between the SIGSTOP and the SIGCONT strands the
+/// daemon: `Fixture::drop` runs `daemon stop`, which a frozen process cannot
+/// answer, and a frozen process never reaches its idle timeout either — so it
+/// sits on the machine indefinitely, immune to SIGTERM (the signal stays
+/// pending until it resumes). Observed in practice after a deliberately
+/// failing run.
+struct Resume(u32);
+
+impl Drop for Resume {
+    fn drop(&mut self) {
+        signal_quietly(self.0, "CONT");
+    }
+}
+
 #[test]
 fn stop_reaches_a_stopped_daemon_once_it_resumes() {
     let fx = Fixture::new();
@@ -718,6 +734,7 @@ fn stop_reaches_a_stopped_daemon_once_it_resumes() {
         .as_u64()
         .unwrap() as u32;
 
+    let _resume = Resume(pid);
     signal(pid, "STOP");
 
     // `stop` cannot confirm an exit while the process is frozen, so it fails
@@ -897,6 +914,123 @@ fn stop_clears_a_lease_whose_endpoint_nobody_serves() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 10. Repository layouts the daemon must not have to guess
+// ---------------------------------------------------------------------------
+//
+// The daemon used to rebuild the git directory as `<repo_root>/.git`, where
+// `repo_root` was itself derived as `commondir.parent()`. That round-trip
+// loses information for every layout except the common one. The client now
+// resolves `commondir` with git2 and sends it, so these work by construction.
+
+/// `git init --separate-git-dir` puts the git directory outside the working
+/// tree and leaves a gitlink file behind. Reconstructing `<root>/.git` gave
+/// "not a git repository" and every command failed.
+#[test]
+fn works_in_a_repository_with_a_separate_git_dir() {
+    let temp = TempDir::new().expect("temp dir");
+    let work = temp.path().join("work");
+    let gitdir = temp.path().join("elsewhere.git");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = Command::new("git")
+        .args(["init", "-q", "--separate-git-dir"])
+        .arg(&gitdir)
+        .arg(&work)
+        .output()
+        .expect("git init --separate-git-dir");
+    assert!(
+        out.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(&["config", "user.email", "test@example.com"], &work);
+    git(&["config", "user.name", "Test"], &work);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"], &work);
+    assert!(
+        work.join(".git").is_file(),
+        ".git should be a gitlink file in this layout"
+    );
+
+    let seq = SOCKET_SEQ.fetch_add(1, Ordering::SeqCst);
+    let socket = PathBuf::from(format!("/tmp/grite-sgd{}-{}.sock", std::process::id(), seq));
+    let _ = std::fs::remove_file(&socket);
+
+    let run = |args: &[&str]| {
+        Command::new(grite_bin())
+            .arg("--json")
+            .args(args)
+            .current_dir(&work)
+            .env("GRITE_DAEMON_SOCKET", &socket)
+            .env("GRITE_DAEMON_BIN", daemon_bin())
+            .env("GRITE_REQUIRE_DAEMON", "1")
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .expect("run grite")
+    };
+
+    run(&["init"]).assert_success("grite init with a separate git dir");
+    run(&["daemon", "start"]).assert_success("daemon start");
+
+    // The real test: a write must route through the daemon and land.
+    let created = run(&["issue", "create", "--title", "separate git dir"]);
+    created.assert_success("issue create through the daemon");
+
+    let listed = run(&["issue", "list"]);
+    listed.assert_success("issue list");
+    assert_eq!(
+        json(&listed)["issues"].as_array().unwrap().len(),
+        1,
+        "the write should be readable back"
+    );
+
+    // Grite state belongs in the real git directory, not next to the gitlink.
+    assert!(
+        gitdir.join("grite").is_dir(),
+        "grite state should live in the separate git dir"
+    );
+    assert!(
+        !work.join(".git").is_dir(),
+        ".git must remain a gitlink file"
+    );
+
+    let _ = run(&["daemon", "stop"]);
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// Two spellings of one path (`/tmp` and `/private/tmp` are the same directory
+/// on macOS) must not produce two workers fighting over one sled store.
+#[test]
+fn differently_spelled_paths_share_one_worker() {
+    let fx = Fixture::new();
+    json(&fx.grite(&["daemon", "start"], None));
+
+    // Reach the same repository by a path with a `..` segment in it.
+    let indirect = fx
+        .main
+        .join("..")
+        .join(fx.main.file_name().expect("repo directory has a name"));
+
+    fx.grite_in(
+        &fx.main.clone(),
+        &["issue", "create", "--title", "direct"],
+        None,
+    )
+    .assert_success("write via the direct path");
+    fx.grite_in(&indirect, &["issue", "create", "--title", "indirect"], None)
+        .assert_success("write via the indirect path");
+
+    assert_eq!(
+        fx.status()["worker_count"].as_u64().unwrap(),
+        1,
+        "one repository must map to one worker however its path is spelled"
+    );
+    let listed = json(&fx.grite(&["issue", "list"], None));
+    assert_eq!(listed["issues"].as_array().unwrap().len(), 2);
+
+    fx.stop();
+}
+
 fn kill9(pid: u32) {
     signal(pid, "KILL");
 }
@@ -911,4 +1045,12 @@ fn signal(pid: u32, name: &str) {
         "kill -{name} {pid} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Send a signal without asserting — for cleanup paths, which may run while
+/// unwinding and must not panic again.
+fn signal_quietly(pid: u32, name: &str) {
+    let _ = Command::new("kill")
+        .args([&format!("-{name}"), &pid.to_string()])
+        .output();
 }

@@ -503,7 +503,10 @@ mod tests {
         .write(data_dir)
         .unwrap();
         let removed = DaemonLock::remove_if_stale(data_dir).unwrap();
-        assert_eq!(removed.map(|l| l.ipc_endpoint).as_deref(), Some("/tmp/dead.sock"));
+        assert_eq!(
+            removed.map(|l| l.ipc_endpoint).as_deref(),
+            Some("/tmp/dead.sock")
+        );
         assert!(DaemonLock::read(data_dir).unwrap().is_none());
     }
 

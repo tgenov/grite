@@ -59,11 +59,7 @@ impl Fixture {
         git(&["commit", "-q", "--allow-empty", "-m", "init"], &main);
 
         let seq = SOCKET_SEQ.fetch_add(1, Ordering::SeqCst);
-        let socket = PathBuf::from(format!(
-            "/tmp/grite-t{}-{}.sock",
-            std::process::id(),
-            seq
-        ));
+        let socket = PathBuf::from(format!("/tmp/grite-t{}-{}.sock", std::process::id(), seq));
         let _ = std::fs::remove_file(&socket);
 
         let fixture = Self {
@@ -88,14 +84,7 @@ impl Fixture {
     fn add_worktree(&self, name: &str) -> (PathBuf, String) {
         let path = self.main.parent().unwrap().join(name);
         git(
-            &[
-                "worktree",
-                "add",
-                "-q",
-                path.to_str().unwrap(),
-                "-b",
-                name,
-            ],
+            &["worktree", "add", "-q", path.to_str().unwrap(), "-b", name],
             &self.main,
         );
 
@@ -382,7 +371,10 @@ fn status_does_not_report_a_dead_daemon_as_running() {
     // Create a worker so the lease actually gets written.
     fx.grite(&["issue", "list"], None)
         .assert_success("issue list");
-    assert!(fx.lock_path().exists(), "worker should have written a lease");
+    assert!(
+        fx.lock_path().exists(),
+        "worker should have written a lease"
+    );
 
     kill9(pid);
     assert!(wait_until(Duration::from_secs(5), || !pid_alive(pid)));
@@ -561,8 +553,12 @@ fn either_worktree_can_auto_start_the_shared_daemon() {
     let (wt_b, actor_b) = fx.add_worktree("wt-auto-b");
 
     // No explicit `daemon start` anywhere.
-    fx.grite_in(&wt_a, &["--actor", &actor_a, "issue", "create", "--title", "a"], None)
-        .assert_success("create from worktree a");
+    fx.grite_in(
+        &wt_a,
+        &["--actor", &actor_a, "issue", "create", "--title", "a"],
+        None,
+    )
+    .assert_success("create from worktree a");
 
     let from_b = fx.grite_in(&wt_b, &["--actor", &actor_b, "daemon", "status"], None);
     assert_eq!(json(&from_b)["running"], true);

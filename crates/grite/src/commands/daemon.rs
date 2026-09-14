@@ -87,7 +87,10 @@ pub fn query_daemon(endpoint: &str) -> Option<DaemonInfo> {
             .and_then(|v| v.as_str())
             .unwrap_or(endpoint)
             .to_string(),
-        started_ts: value.get("started_ts").and_then(|v| v.as_u64()).unwrap_or(0),
+        started_ts: value
+            .get("started_ts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         worker_count: value
             .get("worker_count")
             .and_then(|v| v.as_u64())
@@ -366,7 +369,11 @@ fn log_excerpt(log_path: Option<&Path>) -> String {
         return format!("; see {}", path.display());
     }
     let tail: Vec<&str> = tail.into_iter().rev().collect();
-    format!("; last log lines: {} (full log: {})", tail.join(" | "), path.display())
+    format!(
+        "; last log lines: {} (full log: {})",
+        tail.join(" | "),
+        path.display()
+    )
 }
 
 /// Ensure a daemon is reachable, spawning one if needed.

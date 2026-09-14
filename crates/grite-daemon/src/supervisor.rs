@@ -585,4 +585,3 @@ async fn send_to_worker(request: &IpcRequest, tx: mpsc::Sender<WorkerMessage>) -
         ),
     }
 }
-

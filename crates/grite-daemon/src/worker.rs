@@ -1070,6 +1070,7 @@ fn execute_command_inner(
                     "pull_events": pull_result.events_pulled,
                     "pull_wal_head": wal_head,
                     "message": pull_result.message,
+                    "lock_conflicts": lock_conflicts_json(&pull_result.lock_conflicts),
                 })
             } else if do_push && !do_pull {
                 // Push only with auto-rebase
@@ -1081,6 +1082,7 @@ fn execute_command_inner(
                     "push_rebased": push_result.rebased,
                     "push_events_rebased": push_result.events_rebased,
                     "message": push_result.message,
+                    "lock_conflicts": lock_conflicts_json(&push_result.lock_conflicts),
                 })
             } else {
                 // Full sync: pull then push with auto-rebase
@@ -1096,6 +1098,9 @@ fn execute_command_inner(
                     "push_rebased": push_result.rebased,
                     "push_events_rebased": push_result.events_rebased,
                     "message": format!("{} / {}", pull_result.message, push_result.message),
+                    "lock_conflicts": lock_conflicts_json(
+                        &[pull_result.lock_conflicts, push_result.lock_conflicts].concat(),
+                    ),
                 })
             };
 
@@ -1108,6 +1113,20 @@ fn execute_command_inner(
             )))
         }
     }
+}
+
+/// Lock conflicts reported by a sync, as JSON
+fn lock_conflicts_json(conflicts: &[libgrite_git::LockConflict]) -> serde_json::Value {
+    conflicts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "resource": c.resource,
+                "owner": c.owner,
+                "expires_in_ms": c.expires_in_ms,
+            })
+        })
+        .collect()
 }
 
 /// Convert an IssueProjection to a JSON value with hex-encoded IDs
